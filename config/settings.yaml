@@ -1,0 +1,22 @@
+# Models
+translate_model: gpt-4o
+postedit_model: ft:gpt-4o-mini-2024-07-18:personal:pe-sermons-v2:Bx7YuBIE
+embedding_model: text-embedding-3-large
+
+# Retrieval
+k_examples: 3
+
+# Paths
+chroma_path: data/chroma
+collection_name: sermon_tm_v2
+translate_prompt_path: config/prompts/translate_system.txt
+postedit_prompt_path: config/prompts/postedit_instructions.txt
+
+# IO
+output_raw_dir: output/raw
+output_final_dir: output/final
+output_meta_dir: output/metadata
+
+# Misc
+temperature_translate: 0
+temperature_postedit: 0
