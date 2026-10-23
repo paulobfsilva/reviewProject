@@ -22,13 +22,16 @@ def get_sermon(sermon_id):
         sermon_title = div.find('h1').text
         sermon_place = div.find('h2').text
 
-    # Extract paragraphs, preserving line breaks
+    # Extract paragraphs, preserving line breaks and document order
+    # Include all content types: wmb, scripture, stanza, singing, heading
     paragraphs = []
-    for div in body.find_all('div', class_='wmb'):
-        # Use get_text('\n') to preserve line breaks within the div
-        para_text = div.get_text('\n').strip('\n')
-        if para_text:
-            paragraphs.append(para_text)
+    content_classes = ['wmb', 'scripture', 'stanza', 'singing', 'heading']
+    for div in body.find_all('div'):
+        if any(div.get('class') and class_name in div.get('class') for class_name in content_classes):
+            # Use get_text('\n') to preserve line breaks within the div
+            para_text = div.get_text('\n').strip('\n')
+            if para_text:
+                paragraphs.append(para_text)
 
     return sermon_title, sermon_place, paragraphs
 
@@ -37,8 +40,8 @@ def save_sermon_txt(sermon_id, title, place, paragraphs):
     os.makedirs(output_dir, exist_ok=True)
     filename = os.path.join(output_dir, f"{sermon_id}.txt")
     with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"Title: {title}\n")
-        f.write(f"Place: {place}\n")
+        f.write(f"{title}\n")
+        f.write(f"{place}\n")
         for para in paragraphs:
             # Merge leading number and text if separated by a line break
             fixed_para = re.sub(r"^(\d+)\s*\n\s*", r"\1 ", para, count=1)

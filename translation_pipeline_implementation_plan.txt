@@ -1,0 +1,439 @@
+TRANSLATION PIPELINE — PROBLEM OVERVIEW, TARGET FLOW AND IMPLEMENTATION PLAN
+reviewProject (EN → pt-PT pre-AO90, William Branham sermons)
+Written: 21 October 2026, for Claude Code to implement later.
+Scope of this document: analysis + plan only. No code was changed when it was written;
+the only other file touched was config/prompts/translate_system.txt (rules added).
+
+==========================================================================================
+PART A. WHAT THE REVIEWS SHOW (translation problems seen in published translations)
+==========================================================================================
+
+Reviewed so far, block by block, on translators.messagehub.info:
+65-1204 The Rapture, 60-0802 El Shaddai, 60-0723 Speak To The Rock,
+60-0731 Show Us The Father, 60-0803 Abraham.
+
+The same error families come back in every sermon, roughly in this order of impact:
+
+A1. Bible quotations "completed" from memory (highest impact, every sermon)
+    - ARC wording added where he did not say it (Rev 3:20 "Eis que… em sua casa… com ele",
+      John 6:44 "que me enviou", John 14:12 "Aquele que crê em mim").
+    - Verses reordered into ARC order (Rev 3:17, Gen 22:8), his ellipses removed.
+    - His person/number/tense changed ("you" → "alguém", "said" → "diz", "words" → "palavra").
+    - His explanation broken ("since you believed" → "quando crestes").
+    Root cause: the model recognises the verse and reproduces the canonical text. A prompt
+    rule alone does not stop this; the model needs the KJV text and the "what he actually
+    said" diff in front of it, per quote.
+
+A2. Forms of address drift across blocks
+    - Same prayer-line person: você in one block, tu in the next; the interpreter as
+      "Disseste" then "Diga"; the Voice in a vision as "você"; audience as "vós"/"sabes".
+    Root cause: each paragraph is translated in isolation (see B1), so the model cannot
+    know who was being addressed two blocks earlier.
+
+A3. Term inconsistency across blocks
+    - bumping: bater / embate / toque / barulho; balconies: varandas / piso superior;
+      one hymn refrain translated four different ways; seed: semente / descendência.
+    Root cause: same as A2 — no sermon-level memory.
+
+A4. Meaning errors in the life stories (idioms and polysemy)
+    - school me → "ensinar-me"; discharged → "dispensada"; speaker → "altifalante";
+      footboard/headboard swapped; Indian → "Indiana"; saplings → "arbustos";
+      impersonal "they send" → "vocês enviam"; third-person "let him sit" → "deixem-Me".
+    Root cause: literal, sentence-local translation; no second pass that asks
+    "does this make sense in the story?".
+
+A5. Mechanical rule violations (easy to detect automatically, still frequent)
+    - "porque…?" in questions, "acreditar", gerunds, "Oh" dropped from "Oh, bem",
+      proclisis after subject pronouns, -lo/-la contractions, simple future,
+      Brazilianisms (meio que, chamado, depois que), AO spellings (Laodicéia, impôr, Jacó),
+      translator notes "[… - Trad.]", unconverted miles.
+    Root cause: no deterministic linter between the model output and the human.
+
+A6. Formatting fidelity
+    - EN line breaks merged in PT (most frequent formatting error), ellipses added at
+      block boundaries, quotes added at block end, dash spacing.
+    Root cause: no structural check (line count per block) after generation.
+
+==========================================================================================
+PART B. WHAT THE CURRENT PIPELINE DOES (and why it produces Part A)
+==========================================================================================
+
+Current flow (README + scripts/process_sermon.py):
+  fetch_sermon.py  →  input/en/<id>.txt
+  process_sermon.py:
+     1. translate title and place with the full system prompt (gpt-4o, T=0)
+     2. translate EACH PARAGRAPH SEPARATELY with translate_system.txt (no context)
+     3. post-edit each paragraph with a fine-tuned gpt-4o-mini
+        (ft:gpt-4o-mini-2024-07-18:personal:pe-sermons-v2) + 3 TM examples from Chroma,
+        using postedit_instructions.txt (5 generic lines; knows none of the rules)
+     4. if PE is <85% of RAW length → retry, then fall back to RAW
+     5. write output/raw, output/final, output/metadata/<id>.jsonl
+  review/build_docx.py → .docx for human review → pasted into messagehub by hand.
+
+Findings from reading the code:
+
+B1. Paragraph-isolated translation (process_sermon.py, chat_translate per paragraph).
+    Direct cause of A2 and A3, and contributes to A1 (no surrounding context to tell a
+    quote from commentary when a quote spans blocks).
+
+B2. The post-editor is rule-blind and can undo the rules.
+    - postedit_instructions.txt does not contain any of the translation rules.
+    - It is a fine-tuned mini model trained on data/pe_ft_train.jsonl (older human
+      translations). TM examples from data/corpus.jsonl may contain the very forms the
+      rules now forbid (acreditar, ARC completions, "Porque…?"). Nothing filters them.
+    - Its system message is a one-liner; the RAW output of the strong model is "corrected"
+      by a weaker model that has never seen the rules.
+    → Needs measuring (Phase 0) before deciding to keep, retrain, or drop it.
+
+B3. The QA package is mostly empty or broken.
+    - Empty files (0 lines): qa/adequacy.py, heuristics.py, io_helpers.py, lt_check.py,
+      run_qa.py, scoring.py, units.py; config/glossary.json and config/pre_ao_map.json
+      are 0 bytes.
+    - qa/bible.py: reads config/qa.yaml with json.loads (it is YAML → crash); the bible
+      keys live in config/qa/qa.yaml, not config/qa.yaml (two qa.yaml files);
+      config/book_map.json is invalid JSON (contains a /* … */ comment) and uses
+      Brazilian spellings (Gênesis, Deuteronômio → PE: Génesis, Deuteronómio);
+      the SQL (verse/book join) does not match the schema declared in qa/qa.yaml
+      (table "verses"); only single-verse refs are checked.
+    - More importantly, bible.py's LOGIC rewards a PT paragraph that contains the full
+      ARC verse. That is the opposite of rule 2 (only the segments he said). It would
+      push translations toward error A1. It must be redesigned, not just fixed.
+    - lean_checks.scripture_refs looks for the ENGLISH reference string ("John 3:16")
+      inside the Portuguese text → always flags. Coverage check compares PE with RAW,
+      not with the English source.
+    - lean_checks has no line-count check, no forbidden-forms check beyond AO spellings.
+
+B4. Input parsing risks (to verify with tests).
+    - utils.split_numbered_paragraphs starts a new paragraph on ANY line matching
+      "^\d+\s" — a read-aloud scripture line that begins with a verse number
+      ("16 For God so loved…") or a line like "3 o'clock" inside a block would be cut
+      into a fake paragraph.
+    - fetch_sermon.py uses get_text('\n'): inline tags (<i>, <a>, <span>) may create
+      line breaks that are not real EN line breaks, which then become "line breaks the
+      PT must keep".
+    - The header translation goes through the full sermon prompt; the official PT title
+      already exists on messagehub (e.g. "Abraão") and could be fetched instead.
+
+B5. Models and cost.
+    - translate_model gpt-4o (2024), temperature 0. The 18 KB system prompt is re-sent
+      for every paragraph (≈85–200 calls per sermon) — acceptable only with prompt
+      caching; a windowed approach (Part C) reduces calls.
+    - Models should be configurable per stage so the pipeline can be benchmarked on
+      newer/stronger models without code changes.
+
+B6. Two sources of truth for rules.
+    - Rules live in prose (translate_system.txt) and, separately, in the reviewer skill's
+      regex scan. Neither the pipeline nor the corpus uses them. Every new review finding
+      has to be added by hand in several places.
+
+==========================================================================================
+PART C. RECOMMENDED TRANSLATION FLOW
+==========================================================================================
+
+Principle: let the model translate with full context, then catch everything that can be
+caught mechanically, then send ONLY the problem blocks back with the specific problem,
+then give the human a short, prioritised report — and feed the human's corrections back.
+
+  0. FETCH       EN text + metadata (+ official PT title/place if it exists).
+                 Validate block numbering and line structure.
+
+  1. ANALYSE     One pass over the whole sermon (LLM + deterministic help) producing a
+                 "sermon sheet" (JSON):
+                   - Bible quotes per block: detected passage, KJV text, and a
+                     segment diff "said = KJV" / "his own words" / "KJV not said";
+                     ARC text only for the "said = KJV" segments.
+                   - Addressees per block/scene: audience / person in line (você) /
+                     interpreter (você) / God (Tu) / Satan (tu) / characters (tu) /
+                     Voice in vision (tu).
+                   - Recurring terms and hymn lines (first rendering fixed here).
+                   - Measurements to convert; proper names not to translate.
+
+  2. TRANSLATE   Windowed: block N is translated with
+                   - the system prompt (cached),
+                   - the sermon sheet slice for block N (quotes, addressee, terms),
+                   - the previous 2 blocks EN+PT (already translated) and next block EN,
+                   - output = block N only, same line count.
+                 Blocks can be done in sequential batches (e.g. 5 blocks per call) to
+                 cut calls while keeping the "same block in, same block out" contract.
+
+  3. LINT        Deterministic Python checks (no LLM), per block:
+                   structure  : line count EN = PT, numbering, ellipses at block edges,
+                                quotes balance, brackets, dash spacing, notes "Trad.";
+                   rules      : forbidden-forms list (single machine-readable file),
+                                "Oh, my"/"Oh, bem" counts, gerunds outside quotes,
+                                proclisis after subject pronouns, -lo/-la, AO list;
+                   measures   : miles/feet/°F left unconverted;
+                   bible      : PT contains ARC words in segments marked "KJV not said".
+                 Safe, unambiguous fixes are applied automatically and logged
+                 (Laodicéia→Laodiceia, impôr→impor, Davi→David, Jacó→Jacob, "[… - Trad.]" removed).
+
+  4. REVISE      Only flagged blocks go back to the main model with: EN block, PT block,
+                 the exact list of findings, and "change only what is listed; return the
+                 whole block". Re-lint. Max 2 rounds, then leave it for the human.
+                 (The rule-blind fine-tuned post-editor is retired from this path unless
+                 Phase 0 shows it improves quality.)
+
+  5. REVIEW      LLM review pass equivalent to the sermon-translation-review skill
+                 (checks A–K: meaning, Bible, address, consistency…) over the final text,
+                 producing the same report format as the manual reviews:
+                 output/review/<id>_report.md + a short "must fix" list.
+
+  6. HUMAN       docx/messagehub as today, but the reviewer starts from the report.
+
+  7. LEARN       When the human-approved PT is available (export from messagehub):
+                   - diff machine-final vs human-final per block;
+                   - classify each change (Bible / address / glossary / meaning / format);
+                   - propose additions to rules.yaml + translate_system.txt (human approves);
+                   - add the approved sermon to the TM corpus (only after it passes lint).
+
+==========================================================================================
+PART D. IMPLEMENTATION PLAN (for Claude Code)
+==========================================================================================
+
+General constraints
+- Keep the existing CLI working (`python -m scripts.process_sermon …`) until Phase 6
+  switches the default; add new behaviour behind flags/config.
+- Never edit data/ (corpus, chroma, bible DB) in place; write new files with suffixes.
+- Never commit .env or keys. OPENAI_API_KEY stays in env.
+- All prompts stay in config/prompts/; rules data in config/rules/.
+- Every phase ends with tests passing (pytest) and a short CHANGELOG entry.
+- Regression set: 60-0803, 60-0731, 60-0723, 60-0802 (EN already in input/en/).
+  The reviewed findings for these sermons (from the manual reports) become test fixtures.
+
+------------------------------------------------------------------------------------------
+PHASE 0 — Baseline and measurement (do first; ~1 day)
+------------------------------------------------------------------------------------------
+0.1  Add pytest + a tests/ folder. Add requirements actually used (requirements.txt is
+     empty): openai, chromadb, rich, pyyaml, beautifulsoup4, requests, rapidfuzz,
+     python-docx, pandas, language_tool_python (optional extra).
+0.2  Create tests/fixtures/<id>/ for the regression sermons: en.txt, and
+     findings.yaml listing the known errors per block from the manual reports
+     (block, category, wrong fragment, expected fragment).
+0.3  Script scripts/eval/baseline.py: run the CURRENT pipeline on the regression set
+     (or reuse existing outputs) and save RAW and PE separately.
+0.4  Measure with the Phase 2 linter once it exists (re-run then): violations per 1000
+     words for RAW vs PE. Decision gate: if PE ≥ RAW in violations, the fine-tuned
+     post-editor is removed from the default path (Phase 4).
+0.5  Scan data/corpus.jsonl and data/pe_ft_train.jsonl with the linter; report how many
+     TM/FT examples contain forbidden forms. Output: output/eval/corpus_lint.csv.
+
+Acceptance: `pytest` runs; baseline numbers written to output/eval/baseline.json.
+
+------------------------------------------------------------------------------------------
+PHASE 1 — Fix the foundations (~1 day)
+------------------------------------------------------------------------------------------
+1.1  utils.split_numbered_paragraphs: only treat "^\d+\s" as a new paragraph if the
+     number is exactly previous+1 (paragraph numbers are sequential). Test with a block
+     containing a read-aloud verse line starting with "16 ".
+1.2  fetch_sermon.py: build text from the block's real line breaks (<br>, block
+     elements) instead of get_text('\n'); collapse breaks created by inline tags.
+     Save also a JSON form: input/en/<id>.json = {id, title, place, date, blocks:
+     [{n, lines:[…], type: wmb|scripture|stanza|singing|heading}]}. Keep .txt for
+     backwards compatibility. Block `type` is valuable: "scripture" and "stanza"
+     blocks get Bible/hymn handling.
+1.3  Optional: fetch the official PT title/place from messagehub if available, else
+     translate.
+1.4  Config cleanup: one QA config (merge config/qa.yaml into config/qa/qa.yaml, update
+     loaders); fix book_map.json (valid JSON, all 66 books, PE spellings: Génesis,
+     Êxodo, Deuteronómio, Apocalipse…, EN full names + common abbreviations).
+1.5  Inspect data/bible_arc.sqlite schema; write scripts/bible/arc.py with a tested
+     get_verse(book, ch, v) and get_range(). Add a KJV source (public domain) as
+     data/bible_kjv.sqlite (build script from a public-domain KJV text file; no network
+     at runtime).
+
+Acceptance: unit tests for splitting, fetch parsing (saved HTML fixture), ARC and KJV
+lookup (John 6:44, Rev 3:20 return the expected text).
+
+------------------------------------------------------------------------------------------
+PHASE 2 — Single source of truth for rules + deterministic linter (~2 days)
+------------------------------------------------------------------------------------------
+2.1  config/rules/rules.yaml — machine-readable mirror of translate_system.txt §4.3/§5/§7:
+       - id, category (glossary|grammar|spelling|brazilianism|format|address),
+         pattern (regex, Unicode-aware: use (?<!\p{L})…(?!\p{L}) — `\b` fails on
+         accented letters; use the `regex` module), scope (all|outside_bible),
+         severity (high|medium|low), autofix (replacement or null), message_pt,
+         example_wrong, example_right.
+     Seed it from: translate_system.txt §4.3 table, the regex scan in the
+     sermon-translation-review skill (acreditar, porqueQuestion, oraPorque, gerund with
+     skip list, julgamento, farsa, comprometer, badLo, queFeLo, subjProclisis, spelling,
+     brazil), plus: pressionar, embuste, "Trad." notes, Cei, recebes-los, Jacó,
+     translação, altifalante.
+     Fill config/glossary.json from §4.1 (EN term → PT term, forbidden PT variants).
+2.2  scripts/qa/lint.py — `lint_block(en_block, pt_block, block_meta) -> list[Finding]`:
+       structure: line count, numbering, "...." preserved, no ellipsis added at edges,
+                  quote balance vs EN, [ ] kept, "—" spacing as EN;
+       counts:    EN "Oh, my" vs PT "Oh, bem" (sermon level and per block);
+       rules:     every rules.yaml pattern, respecting scope (needs Bible span markers
+                  from Phase 3; until then scope=outside_bible is applied to whole block
+                  and marked low confidence);
+       measures:  EN has miles/feet/inches/yards/pounds/acres/°F/mph and PT still has
+                  "milhas/pés/polegadas/jardas/libras/acres/Fahrenheit" or the same
+                  number unconverted; skip names in a protected-names list
+                  (Six Mile Island, Green's Mill, …) in config/rules/protected_names.txt.
+     Finding = {block, rule_id, severity, fragment, suggestion, autofixable}.
+2.3  scripts/qa/autofix.py — applies only autofix rules with severity high and no
+     ambiguity; writes a log of every change.
+2.4  CLI: `python -m scripts.qa.lint --sermon-id X [--pt-file …] [--format md|csv|json]`.
+     Works on pipeline output AND on a PT text exported from messagehub, so it can be
+     used to pre-check human translations too.
+2.5  Delete/replace the empty stub modules (adequacy, heuristics, io_helpers, lt_check,
+     run_qa, scoring, units) or implement units.py inside lint (measures). Remove
+     lean_checks.scripture_refs (wrong by design). LanguageTool stays optional.
+2.6  Tests: every fixture finding of category grammar/spelling/format must be detected
+     (recall test); a clean hand-written block must produce zero high findings
+     (precision test).
+
+Acceptance: running the linter on the 4 regression sermons' published PT reproduces
+≥90% of the mechanical findings from the manual reports.
+
+------------------------------------------------------------------------------------------
+PHASE 3 — Bible quote handling (the main quality lever) (~3 days)
+------------------------------------------------------------------------------------------
+3.1  scripts/bible/detect.py — find quotes in EN blocks:
+       a) explicit refs (John 6:44, "Revelation 3:20", "in Saint John the 6th chapter");
+       b) block type "scripture" from fetch JSON;
+       c) fuzzy n-gram match of EN sentences against KJV (rapidfuzz partial_ratio on
+          normalised text, sliding window) to catch unreferenced quotes;
+       d) frequent-verse list (config/rules/bible_traps.yaml, seeded from
+          translate_system.txt §2 traps).
+     Output per quote: block, char span, ref, his_text, kjv_text.
+3.2  scripts/bible/segment_diff.py — align his_text vs kjv_text at phrase level
+     (difflib on tokens, then merge into phrases): label each phrase
+     SAID_AS_KJV | HIS_OWN | KJV_NOT_SAID; attach the corresponding ARC phrase for
+     SAID_AS_KJV phrases only (word alignment KJV↔ARC is approximate: give the ARC verse
+     and the KJV phrase and let the model pick, but list KJV_NOT_SAID phrases explicitly
+     as "must not appear").
+3.3  Bible guidance text injected into the translation prompt per block, e.g.:
+       QUOTE Rev 3:20 — he says: "I stand at the door and knock: if any man hear my
+       voice, and open, I'll come in and sup". KJV phrases he did NOT say: "Behold",
+       "with him, and he with me". ARC verse for wording reference: "…". Translate only
+       what he said, in his order.
+3.4  Bible lint (replaces qa/bible.py logic): flag a PT block that contains the ARC
+     rendering of a KJV_NOT_SAID phrase (normalised fuzzy match ≥ 0.9), or whose quote
+     order differs from his order (sequence check on aligned phrases).
+3.5  Tests from fixtures: Rev 3:20 (60-0803 §49, §54), Rev 3:17 (§44), John 6:37
+     (§26, §66), 1 Cor 2:9 (§41), Gen 22:8 (§1), John 6:44, Acts 19:2, John 14:12.
+
+Acceptance: on the regression set, Bible lint detects all fixture Bible findings, and
+re-translation with guidance removes ≥80% of them.
+
+------------------------------------------------------------------------------------------
+PHASE 4 — Context-aware translation (~3 days)
+------------------------------------------------------------------------------------------
+4.1  scripts/analyse_sermon.py — one LLM call (or a few, chunked by ~40 blocks) that
+     returns the sermon sheet JSON (schema in config/schemas/sermon_sheet.json):
+       addressees per block (who, form), scenes (start/end block, participants, form),
+       recurring terms (EN → chosen PT), hymn lines, proper names, measures.
+     Merge with Phase 3 Bible detection. Validate against the schema; on failure retry
+     once, then continue with Bible data only.
+     Save to output/sheet/<id>.json (human-editable before translation if wanted).
+4.2  scripts/translate_windowed.py:
+       - system = translate_system.txt (unchanged; use provider prompt caching);
+       - user = sermon-sheet slice for target blocks + previous 2 blocks (EN + PT
+         already produced) + next block EN (marked "context only, do not translate") +
+         target block(s) with explicit line count;
+       - response format: JSON {"blocks":[{"n":…, "lines":[…]}]} so line count can be
+         validated immediately; on mismatch, retry that block once with the error.
+       - batch size configurable (default 3 target blocks per call).
+4.3  settings.yaml: add stage-specific model names (analyse_model, translate_model,
+     revise_model, review_model), batch size, context window size, max revise rounds.
+     Provider abstraction in scripts/llm.py (OpenAI now; keep interface small:
+     chat(model, system, user, json_schema=None)).
+4.4  Post-editor decision (from Phase 0.4): if retired, keep the code behind
+     `--legacy-postedit`. If kept, its prompt must include the rules summary and the
+     TM examples must be filtered by the linter (no example with high-severity findings).
+4.5  Metadata: per block store src, sheet slice, raw, revised, findings, model ids,
+     prompt hash (sha256 of translate_system.txt) — so every output can be traced to
+     the rules version that produced it.
+
+Acceptance: on the regression set, address/consistency findings (A2, A3) drop ≥70%
+vs baseline; line-count mismatches = 0 after retry.
+
+------------------------------------------------------------------------------------------
+PHASE 5 — Targeted revision + automated review report (~2 days)
+------------------------------------------------------------------------------------------
+5.1  scripts/revise.py — for blocks with high/medium findings: send EN, PT, findings
+     list; instruction "fix only these; return the full block, same line count".
+     Re-lint; max 2 rounds; remaining findings go to the report.
+5.2  config/prompts/review_system.txt — port the sermon-translation-review skill's
+     checks A–K and report format (sections 1–12) to a prompt that works on local
+     text (no browser). Input in chunks of ~20 blocks with the sermon sheet; merge
+     chunk reports; deduplicate.
+5.3  scripts/review/report.py → output/review/<id>_report.md (same layout as the manual
+     reports: alignment, Bible, meaning, rules, address, gerunds, pronouns, future,
+     spelling, consistency, formatting, optional + "suggested additions to the
+     instructions").
+5.4  build_docx.py: add an option to include findings as Word comments per paragraph
+     (python-docx comments, or a coloured marker + endnote if comments are unavailable).
+
+Acceptance: report for 60-0803 generated locally covers ≥80% of the manual report's
+"most urgent" items.
+
+------------------------------------------------------------------------------------------
+PHASE 6 — Orchestration and CLI (~1 day)
+------------------------------------------------------------------------------------------
+6.1  scripts/pipeline.py:
+       python -m scripts.pipeline --sermon-id 60-0803 [--from fetch|analyse|translate|
+         lint|revise|review|docx] [--to …] [--blocks 40-60] [--dry-run]
+     Each stage reads/writes files under output/<stage>/<id>.*, so any stage can be
+     re-run alone (resume after failure, or re-run review after a rules change).
+6.2  Cost/time log per stage (tokens in/out, calls) in output/metadata/<id>_run.json.
+6.3  Update README.md with the new flow; keep the old commands documented as legacy.
+
+------------------------------------------------------------------------------------------
+PHASE 7 — Feedback loop from human corrections (~2 days)
+------------------------------------------------------------------------------------------
+7.1  scripts/learn/import_final.py — import the human-approved PT (text export from
+     messagehub, or the reviewed docx) into final/<id>.txt, aligned by block.
+7.2  scripts/learn/diff_final.py — per block diff machine vs human; classify changes
+     with a small LLM call (categories as in the report); output
+     output/learn/<id>_changes.csv.
+7.3  scripts/learn/propose_rules.py — aggregate changes across sermons; propose new
+     rules.yaml entries / bible_traps entries / glossary entries with counts and
+     examples → output/learn/proposals.md. A human approves; nothing is auto-merged
+     into translate_system.txt.
+7.4  TM update: only human-approved sermons that pass lint (no high findings) are added
+     to the corpus (update_tm_db_full.py with a --lint-gate flag). Rebuild the Chroma
+     collection as sermon_tm_v3 (do not overwrite v2).
+7.5  Keep translate_system.txt and rules.yaml in sync: a test that every row of
+     translate_system.txt §4.3 has a rules.yaml entry (parse the table) and vice versa
+     for severity=high rules.
+
+------------------------------------------------------------------------------------------
+ORDER, DEPENDENCIES, RISKS
+------------------------------------------------------------------------------------------
+Order: 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7. Phase 2 (linter) gives value on its own and can be
+used on human translations immediately; do it before any model changes.
+
+Risks and mitigations
+- KJV↔ARC phrase alignment is imperfect → never auto-insert ARC text; only use it as
+  guidance and as a "must not appear" list for KJV_NOT_SAID phrases.
+- Regex false positives (e.g. "porque" in causal clauses, gerunds inside Bible quotes)
+  → severity levels, Bible-span scoping from Phase 3, and a per-rule allowlist.
+- JSON-mode responses can truncate on long blocks → per-block retry and line-count
+  validation; batch size configurable.
+- Cost increase from context windows → prompt caching for the system prompt, batches of
+  blocks per call, and the review pass only on final text.
+- Rules drift between prose prompt and rules.yaml → sync test (7.5) and prompt hash in
+  metadata (4.5).
+
+Definition of done (whole project)
+- One command produces: final PT, lint findings, review report, docx with comments.
+- On the regression set: 0 line-count mismatches; 0 high-severity lint findings in the
+  final text; Bible fixture findings ≤20% of baseline; address/consistency findings
+  ≤30% of baseline.
+- README documents the flow; tests pass.
+
+Rules changed on 21 October 2026 (config/prompts/translate_system.txt), from the
+60-0803 Abraham review and the earlier reviews:
+- §1.2–1.5 new false friends/confusions (speaker, school me, discharged, footboard,
+  Indian, saplings, grease, press on, mule, cripple…), third person / impersonal
+  subject, broken English kept broken, Jacob/David, nationalities.
+- §2 new Bible traps: Rev 3:20, Rev 3:17, John 6:37, 1 Cor 2:9, John 5:24, Gen 22:8,
+  "testify", "said" vs "diz".
+- §3 interpreter and Voice-in-vision forms; same-person consistency examples; singular
+  "you"; no "vós" to the audience.
+- §4.1 bluff/embuste, trasladação, vocação, fila de oração; §4.2 "Ora, por que…?";
+  §4.3 new forbidden forms; new §4.4 recurring terms.
+- §7 no "Trad." notes, quotes at block edges, separate speech lines; §8 four new
+  checks; §9 title/place requests; most-violated list extended.

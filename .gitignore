@@ -259,6 +259,7 @@ input/en/61-0118.txt
 input/en/61-0117.txt
 input/en/59-1126.txt
 input/en/55-0116A.txt
+input/en/*
 .DS_Store
 requirements.txt
 sermons_pt.xlsx
